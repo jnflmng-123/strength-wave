@@ -4,7 +4,7 @@ A five-day strength log for one lifter. Home-screen web app for iPhone; no App S
 
 ## Install on the iPhone
 
-1. Open the site in Safari (the address is in the GitHub Pages settings of this repo).
+1. Open https://jnflmng-123.github.io/strength-wave/ in Safari.
 2. Tap the Share button, then **Add to Home Screen**, then **Add**.
 3. Open it from the home screen from now on. The home-screen copy keeps its own data, separate from the Safari tab, so install first and log second.
 
