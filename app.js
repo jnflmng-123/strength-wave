@@ -1,7 +1,7 @@
 /* Strength Wave: a five-day strength log. Vanilla JS, everything in localStorage. */
 'use strict';
 
-const APP_VERSION = '2026-09-11.1';
+const APP_VERSION = '2026-09-16.1';
 const STORE_KEY = 'wave.v1';
 const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const WD_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
