@@ -1,5 +1,5 @@
 /* Strength Wave service worker: app shell offline, fonts cached once seen. */
-const VERSION = 'wave-2026-09-16.1';
+const VERSION = 'wave-2026-11-03.1';
 const SHELL = [
   './',
   './index.html',

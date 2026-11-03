@@ -16,6 +16,8 @@ The app works offline after the first load. Updates arrive on the next open whil
 - **History.** Body weight with a 7-day average, energy, a per-lift chart of top sets and estimated max, and every session, editable.
 - **Peptides.** Log doses. Compounds carry a default dose, shot days and a time; Today shows a banner when one is due. iOS does not let a web app schedule its own notifications, so the "Add reminders to Calendar" button builds a repeating Calendar event with an alert instead.
 - **Program.** The wave (week 1 to 4) and the whole program, editable: swap, add, reorder, remove exercises; change sets, reps, RPE and percentages. Starting a new wave proposes week-1 top sets from what was logged.
+- **Apple Watch.** iOS gives a web app no access to Apple Health, so Watch data comes in through the Health app's own export: Health, your picture, **Export All Health Data**, Save to Files, then **Import Health export** on the Data tab and pick `export.zip`. The app reads it on the phone and keeps only workouts (time, calories, heart rate, distance), resting heart rate and HRV. Re-importing merges. History shows a Recovery chart, Watch stats on each session, and Watch cardio workouts.
+- **Cardio.** Today has a form for treadmill and other machine work (minutes, distance, incline, calories, heart rate), copied off the console's summary screen. History totals it alongside the Watch's cardio.
 - **Data.** Export to a JSON file through the share sheet (save it to OneDrive so the PC can read it), import from a file, rest-timer lengths, erase.
 
 ## Files

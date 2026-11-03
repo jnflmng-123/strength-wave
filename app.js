@@ -1,7 +1,7 @@
 /* Strength Wave: a five-day strength log. Vanilla JS, everything in localStorage. */
 'use strict';
 
-const APP_VERSION = '2026-09-16.1';
+const APP_VERSION = '2026-11-03.1';
 const STORE_KEY = 'wave.v1';
 const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const WD_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -136,6 +136,8 @@ function defaults() {
       { id: 'c_motsc', name: 'MOTS-c', unit: 'mg', defaultDose: null, days: [], time: '08:00' }
     ],
     doses: [],
+    health: { workouts: {}, days: {}, through: null, importedAt: null },
+    cardio: [],
     timer: null,
     ui: { tab: 'today', openEx: null, sessionKey: null, viewSession: null, editEx: null, chartEx: null, doseFor: null, proposals: null }
   };
@@ -310,6 +312,190 @@ function proposeNextWave() {
   return out;
 }
 
+/* ---------- Apple Watch data, via the Health app's "Export All Health Data" ----------
+   iOS gives a web app no HealthKit access, so the export file is the bridge. It is read in a
+   stream on the phone; only workouts, resting heart rate and HRV are kept. */
+const HK_WORKOUT = {
+  TraditionalStrengthTraining: 'Strength', FunctionalStrengthTraining: 'Functional strength', CoreTraining: 'Core',
+  HighIntensityIntervalTraining: 'HIIT', Running: 'Run', Walking: 'Walk', Cycling: 'Bike', Rowing: 'Row',
+  Elliptical: 'Elliptical', StairClimbing: 'Stairs', Hiking: 'Hike', Swimming: 'Swim', Yoga: 'Yoga',
+  MixedCardio: 'Mixed cardio', Cooldown: 'Cooldown', Flexibility: 'Flexibility', CrossTraining: 'Cross training'
+};
+const STRENGTH_KINDS = new Set(['Strength', 'Functional strength', 'Core', 'HIIT', 'Cross training']);
+const CARDIO_KINDS = ['Treadmill', 'Bike', 'Rower', 'Elliptical', 'Stairs', 'Other'];
+function workoutKind(raw) {
+  const t = String(raw || '').replace('HKWorkoutActivityType', '');
+  return HK_WORKOUT[t] || t.replace(/([a-z])([A-Z])/g, '$1 $2') || 'Workout';
+}
+function hkTime(s) { // "2026-10-01 07:00:00 -0500"
+  const m = /^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) ?([+-]\d\d)(\d\d)$/.exec(s || '');
+  return m ? Date.parse(`${m[1]}T${m[2]}${m[3]}:${m[4]}`) : Date.parse(s);
+}
+const xmlUnesc = (s) => s.replace(/&(#x?[0-9a-f]+|amp|lt|gt|quot|apos);/gi, (m, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e.toLowerCase()] || String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10))));
+function xmlAttrs(tag) { const o = {}; const re = /([\w:]+)="([^"]*)"/g; let m; while ((m = re.exec(tag))) o[m[1]] = xmlUnesc(m[2]); return o; }
+function toKcal(v, unit) { const n = num(v); if (n == null) return null; return /kj/i.test(unit || '') ? n / 4.184 : n; }
+function toMiles(v, unit) {
+  const n = num(v); if (n == null) return null;
+  return { km: n / 1.609344, m: n / 1609.344, yd: n / 1760, ft: n / 5280 }[String(unit || 'mi').toLowerCase()] ?? n;
+}
+function parseWorkout(el) {
+  const open = el.slice(0, el.indexOf('>') + 1);
+  const a = xmlAttrs(open);
+  const start = hkTime(a.startDate), end = hkTime(a.endDate);
+  if (!Number.isFinite(start)) return null;
+  const durMin = a.duration == null ? null : /^min/i.test(a.durationUnit || 'min') ? num(a.duration) : /^h/i.test(a.durationUnit) ? num(a.duration) * 60 : num(a.duration) / 60;
+  const w = {
+    id: `${a.startDate}|${a.workoutActivityType}`, kind: workoutKind(a.workoutActivityType), date: a.startDate.slice(0, 10), start,
+    min: durMin ?? (Number.isFinite(end) ? (end - start) / 60000 : null),
+    kcal: toKcal(a.totalEnergyBurned, a.totalEnergyBurnedUnit), mi: toMiles(a.totalDistance, a.totalDistanceUnit),
+    avgHR: null, maxHR: null, indoor: false, source: a.sourceName || ''
+  };
+  const re = /<(WorkoutStatistics|MetadataEntry)\b[^>]*>/g; let m;
+  while ((m = re.exec(el))) {
+    const s = xmlAttrs(m[0]);
+    if (m[1] === 'MetadataEntry') { if (s.key === 'HKIndoorWorkout') w.indoor = s.value === '1'; continue; }
+    const t = (s.type || '').replace('HKQuantityTypeIdentifier', '');
+    if (t === 'ActiveEnergyBurned') w.kcal = toKcal(s.sum, s.unit) ?? w.kcal;
+    else if (t === 'HeartRate') { w.avgHR = num(s.average); w.maxHR = num(s.maximum); }
+    else if (/^Distance/.test(t) && w.mi == null) w.mi = toMiles(s.sum, s.unit);
+  }
+  for (const k of ['min', 'kcal', 'avgHR', 'maxHR']) if (w[k] != null) w[k] = Math.round(w[k]);
+  if (w.mi != null) w.mi = Math.round(w.mi * 100) / 100;
+  return w;
+}
+function healthScanner() {
+  const out = { workouts: [], days: {} };
+  const RE = /<Record\b[^>]*?\btype="HKQuantityTypeIdentifier(RestingHeartRate|HeartRateVariabilitySDNN)"[^>]*>|<Workout\b/g;
+  let buf = '';
+  function push(text) {
+    buf += text;
+    RE.lastIndex = 0;
+    let keep = Math.max(0, buf.length - 8192), m;
+    while ((m = RE.exec(buf))) {
+      if (m[1]) {
+        const a = xmlAttrs(m[0]), v = num(a.value), date = (a.startDate || '').slice(0, 10);
+        if (v != null && date) {
+          const d = out.days[date] || (out.days[date] = { rhr: [], hrv: [] });
+          (m[1] === 'RestingHeartRate' ? d.rhr : d.hrv).push(v);
+        }
+        keep = Math.max(keep, RE.lastIndex);
+        continue;
+      }
+      const gt = buf.indexOf('>', m.index);
+      if (gt < 0) { keep = m.index; break; }
+      const selfClose = buf[gt - 1] === '/';
+      let end = selfClose ? gt + 1 : buf.indexOf('</Workout>', gt);
+      if (end < 0) { keep = m.index; break; }
+      if (!selfClose) end += 10;
+      const w = parseWorkout(buf.slice(m.index, end));
+      if (w) out.workouts.push(w);
+      RE.lastIndex = end;
+      keep = Math.max(keep, end);
+    }
+    buf = buf.slice(keep);
+  }
+  return { push, out };
+}
+async function zipEntry(file, match) {
+  const tailLen = Math.min(file.size, 65557 + 20);
+  const tail = new DataView(await file.slice(file.size - tailLen).arrayBuffer());
+  let eocd = -1;
+  for (let i = tailLen - 22; i >= 0; i--) if (tail.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('that zip file looks damaged');
+  let count = tail.getUint16(eocd + 10, true), size = tail.getUint32(eocd + 12, true), off = tail.getUint32(eocd + 16, true);
+  if ((off === 0xffffffff || size === 0xffffffff || count === 0xffff) && eocd >= 20 && tail.getUint32(eocd - 20, true) === 0x07064b50) {
+    const at = Number(tail.getBigUint64(eocd - 12, true));
+    const z = new DataView(await file.slice(at, at + 56).arrayBuffer());
+    count = Number(z.getBigUint64(32, true)); size = Number(z.getBigUint64(40, true)); off = Number(z.getBigUint64(48, true));
+  }
+  const cd = new DataView(await file.slice(off, off + size).arrayBuffer());
+  const dec = new TextDecoder();
+  for (let n = 0, p = 0; n < count && p + 46 <= cd.byteLength && cd.getUint32(p, true) === 0x02014b50; n++) {
+    const method = cd.getUint16(p + 10, true);
+    let comp = cd.getUint32(p + 20, true), raw = cd.getUint32(p + 24, true), at = cd.getUint32(p + 42, true);
+    const nl = cd.getUint16(p + 28, true), xl = cd.getUint16(p + 30, true), cl = cd.getUint16(p + 32, true);
+    const name = dec.decode(new Uint8Array(cd.buffer, p + 46, nl));
+    for (let q = p + 46 + nl, xe = q + xl; q + 4 <= xe; q += 4 + cd.getUint16(q + 2, true)) {
+      if (cd.getUint16(q, true) !== 1) continue;
+      let r = q + 4;
+      if (raw === 0xffffffff) { raw = Number(cd.getBigUint64(r, true)); r += 8; }
+      if (comp === 0xffffffff) { comp = Number(cd.getBigUint64(r, true)); r += 8; }
+      if (at === 0xffffffff) at = Number(cd.getBigUint64(r, true));
+    }
+    if (match(name)) {
+      const lh = new DataView(await file.slice(at, at + 30).arrayBuffer());
+      const start = at + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+      return { name, method, blob: file.slice(start, start + comp) };
+    }
+    p += 46 + nl + xl + cl;
+  }
+  return null;
+}
+async function readHealthExport(file, onProgress) {
+  const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  let src = file, inflate = false;
+  if (head[0] === 0x50 && head[1] === 0x4b) {
+    const e = await zipEntry(file, (n) => /(^|\/)export\.xml$/.test(n));
+    if (!e) throw new Error('no export.xml inside that zip. Pick the export.zip the Health app made');
+    if (e.method !== 0 && e.method !== 8) throw new Error('unusual zip compression. Unzip it in Files, then pick export.xml');
+    src = e.blob; inflate = e.method === 8;
+  } else if (!/<HealthData\b|<!DOCTYPE HealthData/.test(await file.slice(0, 65536).text())) {
+    throw new Error('not a Health export. Pick export.zip or export.xml');
+  }
+  let read = 0;
+  let stream = src.stream().pipeThrough(new TransformStream({ transform(c, ctl) { read += c.byteLength; ctl.enqueue(c); } }));
+  if (inflate) {
+    let ds;
+    try { ds = new DecompressionStream('deflate-raw'); } catch (e) { throw new Error('this iOS cannot unzip here. Tap the zip in Files to unzip it, then pick export.xml'); }
+    stream = stream.pipeThrough(ds);
+  }
+  const reader = stream.getReader(), td = new TextDecoder(), sc = healthScanner();
+  let last = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    sc.push(td.decode(value, { stream: true }));
+    if (onProgress && Date.now() - last > 300) { last = Date.now(); onProgress(read / (src.size || 1)); }
+  }
+  sc.push(td.decode());
+  return sc.out;
+}
+function mergeHealth(found) {
+  const H = S.health;
+  for (const w of found.workouts) H.workouts[w.id] = w;
+  const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+  for (const [date, d] of Object.entries(found.days)) {
+    const cur = H.days[date] || {};
+    const rhr = avg(d.rhr), hrv = avg(d.hrv);
+    if (rhr != null) cur.rhr = Math.round(rhr);
+    if (hrv != null) cur.hrv = Math.round(hrv);
+    H.days[date] = cur;
+  }
+  const dates = Object.keys(H.days).concat(Object.values(H.workouts).map((w) => w.date)).sort();
+  H.through = dates[dates.length - 1] || null;
+  H.importedAt = Date.now();
+}
+function strengthWorkoutOn(date) {
+  return Object.values(S.health.workouts).filter((w) => w.date === date && STRENGTH_KINDS.has(w.kind)).sort((a, b) => (b.min || 0) - (a.min || 0))[0] || null;
+}
+function watchLine(w) {
+  const bits = [];
+  if (w.min != null) bits.push(`${w.min} min`);
+  if (w.mi != null) bits.push(`${w.mi.toFixed(2)} mi`);
+  if (w.kcal != null) bits.push(`${w.kcal} kcal`);
+  if (w.avgHR != null) bits.push(`HR ${w.avgHR}${w.maxHR != null ? '/' + w.maxHR : ''}`);
+  return bits.join(' · ');
+}
+function cardioLine(c) {
+  const bits = [];
+  if (c.min != null) bits.push(`${c.min} min`);
+  if (c.mi != null) bits.push(`${c.mi} mi`);
+  if (c.incline != null) bits.push(`${c.incline}% incline`);
+  if (c.kcal != null) bits.push(`${c.kcal} kcal`);
+  if (c.avgHR != null) bits.push(`HR ${c.avgHR}`);
+  return bits.join(' · ');
+}
+
 /* ---------- timer ---------- */
 let audioCtx = null;
 function unlockAudio() {
@@ -400,7 +586,24 @@ function renderToday() {
   } else {
     h += `<section class="sec"><div class="sec-head"><h2>Rest day</h2></div><p class="hint" style="margin-top:8px">Nothing scheduled. Check in above, eat the protein.</p>${dayChooser(null)}</section>`;
   }
+  h += cardioSection(d);
   return h;
+}
+function cardioSection(d) {
+  const today = S.cardio.filter((c) => c.date === d);
+  const f = (name, label, ph, mode = 'decimal') => `<div class="field"><label>${label}</label><input type="number" inputmode="${mode}" step="any" name="${name}" placeholder="${ph}"></div>`;
+  return `<section class="sec"><div class="sec-head"><h2>Cardio</h2>${today.length ? `<span class="small muted">${today.length} today</span>` : ''}</div>
+    ${today.length ? `<div class="card list" style="padding:0 14px;margin-top:8px">${today.map((c) => `<div class="list-item"><span><b>${esc(c.kind)}</b></span><span class="mono small">${esc(cardioLine(c))}</span>${c.note ? `<span class="sub">${esc(c.note)}</span>` : ''}</div>`).join('')}</div>` : ''}
+    <details style="margin-top:10px"${S.ui.cardioOpen ? ' open' : ''}><summary class="linkish" data-act="cardio-open">Log treadmill or other cardio</summary>
+    <div class="card stack" id="cardio-form" style="margin-top:8px">
+      <div class="grid2"><div class="field"><label>Machine</label><select name="kind">${CARDIO_KINDS.map((k) => `<option>${k}</option>`).join('')}</select></div>
+      <div class="field"><label>Date</label><input type="date" name="date" value="${d}"></div></div>
+      <div class="grid2">${f('min', 'Minutes', '30')}${f('mi', 'Distance, mi', '2.5')}</div>
+      <div class="grid2">${f('incline', 'Incline, %', '3')}${f('kcal', 'Calories', '300', 'numeric')}</div>
+      <div class="grid2">${f('avgHR', 'Avg heart rate', '135', 'numeric')}<div class="field"><label>Note</label><input type="text" name="note" placeholder="intervals, speed"></div></div>
+      <p class="hint">Copy the numbers off the console's summary screen. If the Watch recorded the same session, it also shows in History from the Watch import; both are kept.</p>
+      <button type="button" class="btn primary block" data-act="save-cardio">Save cardio</button>
+    </div></details></section>`;
 }
 function dayChooser(currentId) {
   const others = S.program.days.filter((d) => d.id !== currentId);
@@ -495,6 +698,8 @@ function renderHistory() {
   const epts = Object.entries(S.checkins).filter(([, c]) => c.energy != null).map(([k, c]) => ({ x: parseKey(k).getTime(), y: c.energy })).sort((a, b) => a.x - b.x).filter((p) => p.x >= now - 60 * DAY_MS);
   h += `<section class="sec"><div class="sec-head"><h2>Energy</h2><span class="small muted">0–10 · last 60 days</span></div><div class="card">${lineChart([{ points: epts, dots: true }], { ymin: 0, ymax: 10, yFmt: (v) => v.toFixed(0), label: 'Energy' })}</div></section>`;
 
+  h += recoverySection(now);
+
   const lifts = allExercises();
   const chartEx = S.ui.chartEx && findEx(S.ui.chartEx) ? S.ui.chartEx : (lifts.find((e) => e.kind === 'main') || lifts[0] || {}).id;
   const ex = chartEx ? findEx(chartEx).ex : null;
@@ -510,18 +715,50 @@ function renderHistory() {
   }
   h += `<section class="sec"><div class="sec-head"><h2>Lifts</h2></div><div class="card stack"><select data-onchange="chart-ex" aria-label="Lift">${lifts.map((e) => `<option value="${e.id}" ${e.id === chartEx ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select>${liftHtml}<p class="hint">Dots: heaviest set each session. Dashed line: estimated max from reps and RPE.</p></div></section>`;
 
+
   if (S.ui.viewSession && S.sessions[S.ui.viewSession]) h += sessionView(S.sessions[S.ui.viewSession]);
   const sessions = allSessionsSorted();
   h += `<section class="sec"><div class="sec-head"><h2>Sessions</h2><span class="small muted">${sessions.length}</span></div><div class="card list" style="padding:0 14px">${sessions.length ? sessions.slice(0, 80).map((s) => {
-    const day = dayById(s.dayId); const n = Object.values(s.sets).reduce((a, x) => a + x.length, 0);
-    return `<button type="button" class="list-item" data-act="view-session" data-key="${esc(s.key)}"><span><b>${fmtDay(s.date)}</b> · ${esc(day ? day.name : s.dayId)}</span><span class="mono muted">${n} sets</span><span class="sub">Wave ${s.wave} wk ${s.week}${s.note ? ' · ' + esc(s.note) : ''}</span></button>`;
+    const day = dayById(s.dayId); const n = Object.values(s.sets).reduce((a, x) => a + x.length, 0); const ww = strengthWorkoutOn(s.date);
+    return `<button type="button" class="list-item" data-act="view-session" data-key="${esc(s.key)}"><span><b>${fmtDay(s.date)}</b> · ${esc(day ? day.name : s.dayId)}</span><span class="mono muted">${n} sets</span><span class="sub">Wave ${s.wave} wk ${s.week}${ww ? ' · ⌚ ' + esc(watchLine(ww)) : ''}${s.note ? ' · ' + esc(s.note) : ''}</span></button>`;
   }).join('') : '<p class="hint" style="padding:12px 0">No sessions yet.</p>'}</div></section>`;
+  h += cardioHistory(now);
   return h;
+}
+function recoverySection(now) {
+  const H = S.health, days = Object.entries(H.days);
+  if (!days.length) return '';
+  const series = (k) => days.filter(([, d]) => d[k] != null).map(([dk, d]) => ({ x: parseKey(dk).getTime(), y: d[k] })).sort((a, b) => a.x - b.x);
+  const meanSince = (pts, n) => { const end = pts.length ? pts[pts.length - 1].x : 0; const w = pts.filter((p) => p.x > end - n * DAY_MS); return w.length ? Math.round(w.reduce((a, p) => a + p.y, 0) / w.length) : '–'; };
+  const block = (k, title, unit) => {
+    const all = series(k), pts = all.filter((p) => p.x >= now - 90 * DAY_MS);
+    if (!all.length) return '';
+    return `<div><div class="row between"><b>${title}</b><span class="small muted">${unit} · last 90 days</span></div>
+      ${lineChart([{ points: pts, dots: true }], { yFmt: (v) => v.toFixed(0), label: title })}
+      <div class="stats">${stat(all[all.length - 1].y, 'latest')}${stat(meanSince(all, 7), '7-day avg')}${stat(meanSince(all, 30), '30-day avg')}</div></div>`;
+  };
+  return `<section class="sec"><div class="sec-head"><h2>Recovery</h2><span class="small muted">Apple Watch · through ${H.through ? fmtDay(H.through) : '–'}</span></div><div class="card stack">
+    ${block('rhr', 'Resting heart rate', 'bpm')}${block('hrv', 'Heart rate variability', 'ms')}
+    <p class="hint">Resting HR creeping up or HRV dropping for several days, alongside low energy, is the usual sign to take the deload early. Values are as of the last import from the Data tab.</p></div></section>`;
+}
+function cardioHistory(now) {
+  const manual = S.cardio.map((c) => ({ date: c.date, kind: c.kind, line: cardioLine(c), note: c.note, id: c.id, min: c.min, mi: num(c.mi), src: 'log' }));
+  const watch = Object.values(S.health.workouts).filter((w) => !STRENGTH_KINDS.has(w.kind)).map((w) => ({ date: w.date, kind: w.kind + (w.indoor ? ', indoor' : ''), line: watchLine(w), min: w.min, mi: w.mi, src: 'watch' }));
+  const all = manual.concat(watch).filter((c) => parseKey(c.date).getTime() >= now - 180 * DAY_MS).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  if (!all.length) return '';
+  const since = (n) => all.filter((c) => parseKey(c.date).getTime() > now - n * DAY_MS);
+  const sum = (arr, k) => arr.reduce((a, c) => a + (c[k] || 0), 0);
+  return `<section class="sec"><div class="sec-head"><h2>Cardio</h2><span class="small muted">last 180 days</span></div>
+    <div class="card"><div class="stats">${stat(sum(since(7), 'min'), 'min, 7 days')}${stat(sum(since(28), 'min'), 'min, 28 days')}${stat(sum(since(28), 'mi').toFixed(1), 'mi, 28 days')}</div>
+    <p class="hint">Totals count a session twice if you logged it here and the Watch also recorded it.</p></div>
+    <div class="card list" style="padding:0 14px;margin-top:10px">${all.slice(0, 30).map((c) => `<div class="list-item"><span><b>${fmtDay(c.date)}</b> · ${esc(c.kind)} <span class="muted small">${c.src === 'watch' ? '⌚' : 'logged'}</span></span>${c.src === 'log' ? `<button type="button" class="icon-btn" data-act="del-cardio" data-id="${c.id}" aria-label="Delete cardio entry">×</button>` : '<span></span>'}<span class="sub mono">${esc(c.line)}${c.note ? ' · ' + esc(c.note) : ''}</span></div>`).join('')}</div></section>`;
 }
 function sessionView(s) {
   const day = dayById(s.dayId);
   const exIds = Object.keys(s.sets).filter((k) => s.sets[k].length);
+  const ww = strengthWorkoutOn(s.date);
   return `<section class="sec"><div class="sec-head"><div><p class="eyebrow">Wave ${s.wave} · week ${s.week}</p><h2>${fmtDay(s.date)} · ${esc(day ? day.name : s.dayId)}</h2></div><button type="button" class="linkish" data-act="close-session">Close</button></div><div class="card stack">
+    ${ww ? `<p class="hint"><b>Apple Watch.</b> <span class="mono">${esc(watchLine(ww))}</span></p>` : ''}
     ${exIds.length ? exIds.map((id) => { const f = findEx(id); const name = f ? f.ex.name : id; const unit = f && f.ex.unit !== 'none' ? f.ex.unit : '';
       return `<div><b>${esc(name)}</b><div class="sets" style="margin-top:4px">${s.sets[id].map((st, i) => `<div class="set"><span class="n">${i + 1}</span><span>${setStr(st, unit)}</span><button type="button" class="icon-btn" data-act="del-set-in" data-key="${esc(s.key)}" data-ex="${id}" data-set="${st.id}" aria-label="Delete set">×</button></div>`).join('')}</div></div>`; }).join('') : '<p class="hint">No sets in this session.</p>'}
     ${s.note ? `<p class="hint">${esc(s.note)}</p>` : ''}
@@ -653,7 +890,7 @@ function countSummary() {
   const sess = Object.values(S.sessions);
   const sets = sess.reduce((a, s) => a + Object.values(s.sets).reduce((b, x) => b + x.length, 0), 0);
   let kb = 0; try { kb = Math.round((localStorage.getItem(STORE_KEY) || '').length / 1024); } catch (e) { /* ignore */ }
-  return `${sess.length} sessions · ${sets} sets · ${Object.keys(S.checkins).length} check-ins · ${S.doses.length} doses · ${kb} KB`;
+  return `${sess.length} sessions · ${sets} sets · ${Object.keys(S.checkins).length} check-ins · ${S.doses.length} doses · ${S.cardio.length} cardio · ${kb} KB`;
 }
 function exportText() {
   const { ui, timer, ...rest } = S;
@@ -681,6 +918,17 @@ function renderData() {
     <button type="button" class="btn block" data-act="copy-json">Copy as text</button>
     <label class="btn block" style="display:flex;align-items:center;justify-content:center">Import from a file<input type="file" accept="application/json,.json" data-onchange="import" style="display:none"></label>
     <p class="hint mono small">${countSummary()}</p></div></section>`;
+  const H = S.health, nW = Object.keys(H.workouts).length, nD = Object.keys(H.days).length;
+  h += `<section class="sec"><div class="sec-head"><h2>Apple Watch</h2></div><div class="card stack">
+    <p class="hint">A web app cannot read Apple Health directly, so this reads the Health app's export file.</p>
+    <ol class="hint" style="margin:0;padding-left:20px">
+      <li>Open the <b>Health</b> app, tap your picture at the top right, then <b>Export All Health Data</b>. It can take a few minutes.</li>
+      <li>When the share sheet appears, choose <b>Save to Files</b>.</li>
+      <li>Come back here, tap the button below and pick <b>export.zip</b>.</li></ol>
+    <p class="hint">Kept: workouts (time, calories, heart rate, distance), resting heart rate and HRV. Everything else in the file is skipped and nothing leaves the phone. Importing again merges; nothing is duplicated.</p>
+    <label class="btn primary block" style="display:flex;align-items:center;justify-content:center">Import Health export<input type="file" accept=".zip,.xml,application/zip,text/xml" data-onchange="import-health" style="display:none"></label>
+    <p class="hint mono small" id="health-status">${nW || nD ? `${nW} workouts · ${nD} days of RHR/HRV · through ${H.through ? fmtDay(H.through) : '–'}${H.importedAt ? ' · imported ' + fmtShort(H.importedAt) : ''}` : 'Nothing imported yet.'}</p>
+    ${nW || nD ? '<button type="button" class="btn ghost small" data-act="clear-health">Clear Watch data</button>' : ''}</div></section>`;
   h += `<section class="sec"><div class="sec-head"><h2>Rest timer</h2><span class="small muted">seconds</span></div><div class="card grid2">
     ${[['restTop', 'Top set'], ['restBack', 'Back-off'], ['restPower', 'Power'], ['restAcc', 'Accessory']].map(([k, l]) => `<div class="field"><label>${l}</label><input type="number" inputmode="numeric" value="${s[k]}" data-bind="settings.${k}" data-type="int"></div>`).join('')}</div></section>`;
   h += `<section class="sec"><div class="sec-head"><h2>App</h2><span class="small muted mono">${APP_VERSION}</span></div><div class="card stack">
@@ -763,6 +1011,16 @@ const ACTIONS = {
   export: async () => { const r = await shareText(`wave-${dateKey()}.json`, exportText(), 'application/json'); toast({ shared: 'Shared', downloaded: 'Downloaded', cancelled: 'Cancelled', failed: 'Export failed' }[r]); },
   'copy-json': async () => { try { await navigator.clipboard.writeText(exportText()); toast('Copied'); } catch (e) { toast('Copy blocked here; use Export'); } },
   reload: () => { location.reload(); },
+  'cardio-open': () => { S.ui.cardioOpen = !S.ui.cardioOpen; save(); rerender(); },
+  'save-cardio': () => {
+    const f = $('#cardio-form'); if (!f) return;
+    const v = (n) => f.querySelector(`[name=${n}]`).value;
+    const c = { id: uid(), kind: v('kind'), date: v('date') || dateKey(), min: num(v('min')), mi: num(v('mi')), incline: num(v('incline')), kcal: int(v('kcal')), avgHR: int(v('avgHR')), note: v('note').trim(), ts: Date.now() };
+    if (c.min == null && c.mi == null && c.kcal == null) return toast('Enter minutes, distance or calories');
+    S.cardio.push(c); S.ui.cardioOpen = false; save(); rerender(); toast(`${c.kind} saved`);
+  },
+  'del-cardio': (d) => { if (!confirm('Delete this cardio entry?')) return; S.cardio = S.cardio.filter((x) => x.id !== d.id); save(); rerender(); },
+  'clear-health': () => { if (!confirm('Clear the imported Watch workouts, resting HR and HRV? Your own logs stay.')) return; S.health = defaults().health; save(); rerender(); toast('Watch data cleared'); },
   'reset-all': () => {
     if (!confirm('Erase every session, dose, check-in and setting on this phone?')) return;
     if (!confirm('Last chance. Export first if you want it back.')) return;
@@ -782,6 +1040,20 @@ const CHANGE = {
     save(); rerender();
   },
   proposal: (d, el) => { const p = S.ui.proposals && S.ui.proposals[+d.i]; if (p) p.proposed = num(el.value); },
+  'import-health': async (d, el) => {
+    const f = el.files && el.files[0]; if (!f) return;
+    const status = $('#health-status');
+    const show = (t) => { if (status) status.textContent = t; };
+    show('Reading… keep the app open.');
+    try {
+      const found = await readHealthExport(f, (p) => show(`Reading… ${Math.round(p * 100)}%. Keep the app open.`));
+      const nd = Object.keys(found.days).length;
+      if (!found.workouts.length && !nd) throw new Error('no workouts, resting HR or HRV found in that file');
+      mergeHealth(found); save(); rerender();
+      toast(`Imported ${found.workouts.length} workouts, ${nd} days`);
+    } catch (e) { show('Import failed: ' + e.message); toast('Import failed'); }
+    el.value = '';
+  },
   import: (d, el) => {
     const f = el.files && el.files[0]; if (!f) return;
     const r = new FileReader();
